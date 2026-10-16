@@ -137,6 +137,7 @@ int  ngx_ssl_server_conf_index;
 int  ngx_ssl_session_cache_index;
 int  ngx_ssl_ticket_keys_index;
 int  ngx_ssl_ocsp_index;
+int  ngx_ssl_verify_reject_index;
 int  ngx_ssl_index;
 int  ngx_ssl_certificate_name_index;
 int  ngx_ssl_certificate_comp_index;
@@ -262,6 +263,14 @@ ngx_ssl_init(ngx_log_t *log)
 
     ngx_ssl_ocsp_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, NULL);
     if (ngx_ssl_ocsp_index == -1) {
+        ngx_ssl_error(NGX_LOG_ALERT, log, 0,
+                      "SSL_CTX_get_ex_new_index() failed");
+        return NGX_ERROR;
+    }
+
+    ngx_ssl_verify_reject_index = SSL_CTX_get_ex_new_index(0, NULL, NULL,
+                                                           NULL, NULL);
+    if (ngx_ssl_verify_reject_index == -1) {
         ngx_ssl_error(NGX_LOG_ALERT, log, 0,
                       "SSL_CTX_get_ex_new_index() failed");
         return NGX_ERROR;
@@ -1197,6 +1206,9 @@ ngx_ssl_cert_already_in_hash(void)
 static int
 ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
 {
+    int                reject;
+    ngx_connection_t  *c;
+    ngx_ssl_conn_t    *ssl_conn;
 #if (NGX_DEBUG)
     char              *subject, *issuer;
     int                err, depth;
@@ -1205,16 +1217,30 @@ ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
     const
 #endif
     X509_NAME         *sname, *iname;
-    ngx_connection_t  *c;
-    ngx_ssl_conn_t    *ssl_conn;
+#endif
 
     ssl_conn = X509_STORE_CTX_get_ex_data(x509_store,
                                           SSL_get_ex_data_X509_STORE_CTX_idx());
 
     c = ngx_ssl_get_connection(ssl_conn);
 
+    reject = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn),
+                                 ngx_ssl_verify_reject_index)
+             != NULL;
+
+    if (!ok && reject) {
+        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                      "client SSL certificate verify error: (%d:%s), "
+                      "rejecting handshake",
+                      X509_STORE_CTX_get_error(x509_store),
+                      X509_verify_cert_error_string(
+                                         X509_STORE_CTX_get_error(x509_store)));
+    }
+
+#if (NGX_DEBUG)
+
     if (!(c->log->log_level & NGX_LOG_DEBUG_EVENT)) {
-        return 1;
+        return reject ? ok : 1;
     }
 
     cert = X509_STORE_CTX_get_current_cert(x509_store);
@@ -1263,7 +1289,32 @@ ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
     }
 #endif
 
-    return 1;
+    return reject ? ok : 1;
+}
+
+
+ngx_int_t
+ngx_ssl_verify_reject(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_uint_t required)
+{
+    int  mode;
+
+    if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_verify_reject_index,
+                            (void *) 1)
+        == 0)
+    {
+        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
+                      "SSL_CTX_set_ex_data() failed");
+        return NGX_ERROR;
+    }
+
+    if (required) {
+        mode = SSL_CTX_get_verify_mode(ssl->ctx)
+               | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        SSL_CTX_set_verify(ssl->ctx, mode,
+                           SSL_CTX_get_verify_callback(ssl->ctx));
+    }
+
+    return NGX_OK;
 }
 
 

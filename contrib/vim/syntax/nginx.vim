@@ -604,6 +604,7 @@ syn keyword ngxDirective contained ssl_stapling_responder
 syn keyword ngxDirective contained ssl_stapling_verify
 syn keyword ngxDirective contained ssl_trusted_certificate
 syn keyword ngxDirective contained ssl_verify_client
+syn keyword ngxDirective contained ssl_verify_client_reject
 syn keyword ngxDirective contained ssl_verify_depth
 syn keyword ngxDirective contained starttls
 syn keyword ngxDirective contained stub_status
