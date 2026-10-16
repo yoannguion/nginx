@@ -31,6 +31,8 @@ static void *ngx_ssl_cert_compression_alloc(void *opaque, u_int items,
 static void ngx_ssl_cert_compression_free(void *opaque, void *address);
 #endif
 static int ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store);
+static int ngx_ssl_cert_verify_callback(X509_STORE_CTX *x509_store,
+    void *arg);
 static void ngx_ssl_info_callback(const ngx_ssl_conn_t *ssl_conn, int where,
     int ret);
 static int ngx_ssl_cmp_x509_name(const X509_NAME *const *a,
@@ -1229,26 +1231,6 @@ ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
                              ngx_ssl_verify_reject_index);
     reject = (vr != NULL);
 
-    /*
-     * the chain is complete and valid when the callback is called
-     * for the leaf certificate: check its revocation status with OCSP
-     * before the handshake completes, using the OCSP cache if possible,
-     * a blocking request to the responder otherwise
-     */
-
-    if (reject && ok
-        && X509_STORE_CTX_get_error_depth(x509_store) == 0
-        && !c->ssl->ocsp_handshake)
-    {
-        c->ssl->ocsp_handshake = 1;
-
-        if (ngx_ssl_ocsp_verify_handshake(c, x509_store, vr->ocsp_timeout)
-            != NGX_OK)
-        {
-            ok = 0;
-        }
-    }
-
     if (!ok && reject) {
         ngx_log_error(NGX_LOG_INFO, c->log, 0,
                       "client SSL certificate verify error: (%d:%s), "
@@ -1314,6 +1296,55 @@ ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
 }
 
 
+static int
+ngx_ssl_cert_verify_callback(X509_STORE_CTX *x509_store, void *arg)
+{
+    int                       rc;
+    ngx_connection_t         *c;
+    ngx_ssl_conn_t           *ssl_conn;
+    ngx_ssl_verify_reject_t  *vr;
+
+    /*
+     * full chain verification first (signatures, CRL, policies...);
+     * with ssl_verify_client_reject, ngx_ssl_verify_callback() returns
+     * the OpenSSL verdict, so any error aborts the handshake here
+     */
+
+    rc = X509_verify_cert(x509_store);
+
+    if (rc != 1) {
+        return rc;
+    }
+
+    ssl_conn = X509_STORE_CTX_get_ex_data(x509_store,
+                                          SSL_get_ex_data_X509_STORE_CTX_idx());
+
+    vr = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn),
+                             ngx_ssl_verify_reject_index);
+    if (vr == NULL) {
+        return 1;
+    }
+
+    c = ngx_ssl_get_connection(ssl_conn);
+
+    /*
+     * the chain is valid: check its revocation status with OCSP before
+     * the handshake completes, using the OCSP cache if possible,
+     * a blocking request to the responder otherwise
+     */
+
+    c->ssl->ocsp_handshake = 1;
+
+    if (ngx_ssl_ocsp_verify_handshake(c, x509_store, vr->ocsp_timeout)
+        != NGX_OK)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
 ngx_int_t
 ngx_ssl_verify_reject(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_uint_t required,
     ngx_msec_t ocsp_timeout)
@@ -1327,6 +1358,9 @@ ngx_ssl_verify_reject(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_uint_t required,
     }
 
     vr->ocsp_timeout = ocsp_timeout;
+
+    SSL_CTX_set_cert_verify_callback(ssl->ctx, ngx_ssl_cert_verify_callback,
+                                     NULL);
 
     if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_verify_reject_index, vr) == 0)
     {

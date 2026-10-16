@@ -201,9 +201,10 @@ static void ngx_ssl_ocsp_sync_handler(ngx_ssl_ocsp_ctx_t *ctx);
 static ngx_int_t ngx_ssl_ocsp_sync_request(ngx_ssl_ocsp_ctx_t *ctx,
     ngx_msec_t timeout);
 static ngx_int_t ngx_ssl_ocsp_sync_exchange(ngx_ssl_ocsp_ctx_t *ctx,
-    ngx_addr_t *addr, ngx_msec_t timeout);
+    ngx_addr_t *addr, ngx_msec_t deadline);
 static ngx_int_t ngx_ssl_ocsp_sync_wait(ngx_ssl_ocsp_ctx_t *ctx,
-    ngx_socket_t s, short events, ngx_msec_t timeout);
+    ngx_socket_t s, short events, ngx_msec_t deadline);
+static ngx_msec_t ngx_ssl_ocsp_sync_now(void);
 #endif
 
 static u_char *ngx_ssl_ocsp_log_error(ngx_log_t *log, u_char *buf, size_t len);
@@ -1463,7 +1464,11 @@ static ngx_int_t
 ngx_ssl_ocsp_sync_request(ngx_ssl_ocsp_ctx_t *ctx, ngx_msec_t timeout)
 {
     ngx_url_t   u;
+    ngx_msec_t  deadline;
     ngx_uint_t  i;
+
+    /* the whole request, all responder addresses included */
+    deadline = ngx_ssl_ocsp_sync_now() + timeout;
 
     if (ngx_ssl_ocsp_create_request(ctx) != NGX_OK) {
         return NGX_ERROR;
@@ -1493,7 +1498,7 @@ ngx_ssl_ocsp_sync_request(ngx_ssl_ocsp_ctx_t *ctx, ngx_msec_t timeout)
         ctx->request->pos = ctx->request->start;
         ctx->data = NULL;
 
-        if (ngx_ssl_ocsp_sync_exchange(ctx, &ctx->addrs[i], timeout)
+        if (ngx_ssl_ocsp_sync_exchange(ctx, &ctx->addrs[i], deadline)
             == NGX_OK)
         {
             return NGX_OK;
@@ -1506,7 +1511,7 @@ ngx_ssl_ocsp_sync_request(ngx_ssl_ocsp_ctx_t *ctx, ngx_msec_t timeout)
 
 static ngx_int_t
 ngx_ssl_ocsp_sync_exchange(ngx_ssl_ocsp_ctx_t *ctx, ngx_addr_t *addr,
-    ngx_msec_t timeout)
+    ngx_msec_t deadline)
 {
     int           err;
     ssize_t       n;
@@ -1541,7 +1546,7 @@ ngx_ssl_ocsp_sync_exchange(ngx_ssl_ocsp_ctx_t *ctx, ngx_addr_t *addr,
             goto failed;
         }
 
-        if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLOUT, timeout) != NGX_OK) {
+        if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLOUT, deadline) != NGX_OK) {
             goto failed;
         }
 
@@ -1573,7 +1578,7 @@ ngx_ssl_ocsp_sync_exchange(ngx_ssl_ocsp_ctx_t *ctx, ngx_addr_t *addr,
         err = ngx_socket_errno;
 
         if (n == -1 && err == NGX_EAGAIN) {
-            if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLOUT, timeout) != NGX_OK) {
+            if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLOUT, deadline) != NGX_OK) {
                 goto failed;
             }
 
@@ -1619,7 +1624,7 @@ ngx_ssl_ocsp_sync_exchange(ngx_ssl_ocsp_ctx_t *ctx, ngx_addr_t *addr,
         err = ngx_socket_errno;
 
         if (err == NGX_EAGAIN) {
-            if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLIN, timeout) != NGX_OK) {
+            if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLIN, deadline) != NGX_OK) {
                 goto failed;
             }
 
@@ -1662,17 +1667,26 @@ failed:
 
 static ngx_int_t
 ngx_ssl_ocsp_sync_wait(ngx_ssl_ocsp_ctx_t *ctx, ngx_socket_t s, short events,
-    ngx_msec_t timeout)
+    ngx_msec_t deadline)
 {
     int            n;
+    ngx_msec_t     now;
     struct pollfd  pfd;
 
     pfd.fd = s;
     pfd.events = events;
-    pfd.revents = 0;
 
     do {
-        n = poll(&pfd, 1, (int) timeout);
+        now = ngx_ssl_ocsp_sync_now();
+
+        if (now >= deadline) {
+            n = 0;
+            break;
+        }
+
+        pfd.revents = 0;
+        n = poll(&pfd, 1, (int) (deadline - now));
+
     } while (n == -1 && ngx_socket_errno == NGX_EINTR);
 
     if (n == 0) {
@@ -1688,6 +1702,30 @@ ngx_ssl_ocsp_sync_wait(ngx_ssl_ocsp_ctx_t *ctx, ngx_socket_t s, short events,
     }
 
     return NGX_OK;
+}
+
+
+static ngx_msec_t
+ngx_ssl_ocsp_sync_now(void)
+{
+#if (NGX_HAVE_CLOCK_MONOTONIC)
+    struct timespec  ts;
+
+#if defined(CLOCK_MONOTONIC_FAST)
+    clock_gettime(CLOCK_MONOTONIC_FAST, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+
+    return (ngx_msec_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+#else
+    struct timeval  tv;
+
+    ngx_gettimeofday(&tv);
+
+    return (ngx_msec_t) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#endif
 }
 
 #endif
