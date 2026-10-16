@@ -264,6 +264,13 @@ static ngx_command_t  ngx_http_ssl_commands[] = {
       offsetof(ngx_http_ssl_srv_conf_t, ocsp_responder),
       NULL },
 
+    { ngx_string("ssl_ocsp_timeout"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_ssl_srv_conf_t, ocsp_timeout),
+      NULL },
+
     { ngx_string("ssl_ocsp_cache"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_ssl_ocsp_cache,
@@ -665,6 +672,7 @@ ngx_http_ssl_create_srv_conf(ngx_conf_t *cf)
     sscf->verify = NGX_CONF_UNSET_UINT;
     sscf->verify_depth = NGX_CONF_UNSET_UINT;
     sscf->verify_reject = NGX_CONF_UNSET;
+    sscf->ocsp_timeout = NGX_CONF_UNSET_MSEC;
     sscf->certificates = NGX_CONF_UNSET_PTR;
     sscf->certificate_keys = NGX_CONF_UNSET_PTR;
     sscf->certificate_cache = NGX_CONF_UNSET_PTR;
@@ -713,6 +721,7 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->verify, prev->verify, 0);
     ngx_conf_merge_uint_value(conf->verify_depth, prev->verify_depth, 1);
     ngx_conf_merge_value(conf->verify_reject, prev->verify_reject, 0);
+    ngx_conf_merge_msec_value(conf->ocsp_timeout, prev->ocsp_timeout, 5000);
 
     ngx_conf_merge_ptr_value(conf->certificates, prev->certificates, NULL);
     ngx_conf_merge_ptr_value(conf->certificate_keys, prev->certificate_keys,
@@ -889,7 +898,8 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     if (conf->verify_reject && (conf->verify == 1 || conf->verify == 2)) {
-        if (ngx_ssl_verify_reject(cf, &conf->ssl, conf->verify == 1)
+        if (ngx_ssl_verify_reject(cf, &conf->ssl, conf->verify == 1,
+                                  conf->ocsp_timeout)
             != NGX_OK)
         {
             return NGX_CONF_ERROR;

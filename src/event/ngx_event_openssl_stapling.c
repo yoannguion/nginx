@@ -10,6 +10,10 @@
 #include <ngx_event.h>
 #include <ngx_event_connect.h>
 
+#if !(NGX_WIN32)
+#include <poll.h>
+#endif
+
 
 #if (!defined OPENSSL_NO_OCSP && defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB)
 
@@ -191,6 +195,16 @@ static ngx_int_t ngx_ssl_ocsp_verify(ngx_ssl_ocsp_ctx_t *ctx);
 static ngx_int_t ngx_ssl_ocsp_cache_lookup(ngx_ssl_ocsp_ctx_t *ctx);
 static ngx_int_t ngx_ssl_ocsp_cache_store(ngx_ssl_ocsp_ctx_t *ctx);
 static ngx_int_t ngx_ssl_ocsp_create_key(ngx_ssl_ocsp_ctx_t *ctx);
+
+#if !(NGX_WIN32)
+static void ngx_ssl_ocsp_sync_handler(ngx_ssl_ocsp_ctx_t *ctx);
+static ngx_int_t ngx_ssl_ocsp_sync_request(ngx_ssl_ocsp_ctx_t *ctx,
+    ngx_msec_t timeout);
+static ngx_int_t ngx_ssl_ocsp_sync_exchange(ngx_ssl_ocsp_ctx_t *ctx,
+    ngx_addr_t *addr, ngx_msec_t timeout);
+static ngx_int_t ngx_ssl_ocsp_sync_wait(ngx_ssl_ocsp_ctx_t *ctx,
+    ngx_socket_t s, short events, ngx_msec_t timeout);
+#endif
 
 static u_char *ngx_ssl_ocsp_log_error(ngx_log_t *log, u_char *buf, size_t len);
 
@@ -904,6 +918,11 @@ ngx_ssl_ocsp_validate(ngx_connection_t *c)
         return NGX_AGAIN;
     }
 
+    if (c->ssl->ocsp_handshake) {
+        /* already checked during the handshake, see ngx_ssl_verify_reject() */
+        return NGX_OK;
+    }
+
     ssl_ctx = SSL_get_SSL_CTX(c->ssl->connection);
 
     ocf = SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_ocsp_index);
@@ -1105,7 +1124,7 @@ done:
     ocsp->status = rc;
 
     if (c->ssl->in_ocsp) {
-        c->ssl->handshaked = 1;
+        c->ssl->handshaked = !ngx_ssl_ocsp_rejected(c);
         c->ssl->handler(c);
     }
 }
@@ -1149,7 +1168,7 @@ done:
     ngx_ssl_ocsp_done(ctx);
 
     if (c->ssl->in_ocsp) {
-        c->ssl->handshaked = 1;
+        c->ssl->handshaked = !ngx_ssl_ocsp_rejected(c);
         c->ssl->handler(c);
     }
 }
@@ -1274,6 +1293,404 @@ ngx_ssl_ocsp_get_status(ngx_connection_t *c, const char **s)
 
     return NGX_DECLINED;
 }
+
+
+ngx_uint_t
+ngx_ssl_ocsp_rejected(ngx_connection_t *c)
+{
+    const char  *s;
+
+    if (SSL_CTX_get_ex_data(SSL_get_SSL_CTX(c->ssl->connection),
+                            ngx_ssl_verify_reject_index)
+        == NULL)
+    {
+        return 0;
+    }
+
+    if (ngx_ssl_ocsp_get_status(c, &s) == NGX_OK) {
+        return 0;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "client SSL certificate verify error: %s, "
+                  "closing connection", s);
+
+    return 1;
+}
+
+
+ngx_int_t
+ngx_ssl_ocsp_verify_handshake(ngx_connection_t *c, X509_STORE_CTX *x509_store,
+    ngx_msec_t timeout)
+{
+#if (NGX_WIN32)
+
+    return NGX_OK;
+
+#else
+
+    int                   err;
+    ngx_int_t             rc;
+    ngx_uint_t            i, n;
+    const char           *reason;
+    SSL_CTX              *ssl_ctx;
+    STACK_OF(X509)       *chain;
+    ngx_ssl_conn_t       *ssl_conn;
+    ngx_ssl_ocsp_ctx_t   *ctx;
+    ngx_ssl_ocsp_conf_t  *ocf;
+
+    ssl_conn = X509_STORE_CTX_get_ex_data(x509_store,
+                                          SSL_get_ex_data_X509_STORE_CTX_idx());
+    ssl_ctx = SSL_get_SSL_CTX(ssl_conn);
+
+    ocf = SSL_CTX_get_ex_data(ssl_ctx, ngx_ssl_ocsp_index);
+    if (ocf == NULL) {
+        return NGX_OK;
+    }
+
+    chain = X509_STORE_CTX_get0_chain(x509_store);
+    if (chain == NULL) {
+        return NGX_OK;
+    }
+
+    n = sk_X509_num(chain);
+
+    for (i = 0; i + 1 < n; i++) {
+
+        if (ocf->depth == 2 && i == 1) {
+            break;
+        }
+
+        ctx = ngx_ssl_ocsp_start(c->log);
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+
+        ctx->ssl_ctx = ssl_ctx;
+        ctx->cert = sk_X509_value(chain, i);
+        ctx->issuer = sk_X509_value(chain, i + 1);
+        ctx->chain = chain;
+
+        ctx->handler = ngx_ssl_ocsp_sync_handler;
+        ctx->data = NULL;
+
+        ctx->shm_zone = ocf->shm_zone;
+
+        ctx->addrs = ocf->addrs;
+        ctx->naddrs = ocf->naddrs;
+        ctx->host = ocf->host;
+        ctx->uri = ocf->uri;
+        ctx->port = ocf->port;
+
+        err = X509_V_ERR_APPLICATION_VERIFICATION;
+        reason = "certificate status request failed";
+
+        if (ngx_ssl_ocsp_responder(c, ctx) != NGX_OK) {
+            goto failed;
+        }
+
+        if (ctx->uri.len == 0) {
+            ngx_str_set(&ctx->uri, "/");
+        }
+
+        rc = ngx_ssl_ocsp_cache_lookup(ctx);
+
+        if (rc == NGX_ERROR) {
+            goto failed;
+        }
+
+        if (rc == NGX_DECLINED) {
+
+            ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "ssl ocsp handshake request, cert:%ui", i);
+
+            if (ngx_ssl_ocsp_sync_request(ctx, timeout) != NGX_OK
+                || ngx_ssl_ocsp_verify(ctx) != NGX_OK
+                || ngx_ssl_ocsp_cache_store(ctx) != NGX_OK)
+            {
+                goto failed;
+            }
+        }
+
+        if (ctx->status == V_OCSP_CERTSTATUS_REVOKED) {
+            err = X509_V_ERR_CERT_REVOKED;
+            reason = "certificate revoked";
+            goto failed;
+        }
+
+        if (ctx->status != V_OCSP_CERTSTATUS_GOOD) {
+#ifdef X509_V_ERR_OCSP_CERT_UNKNOWN
+            err = X509_V_ERR_OCSP_CERT_UNKNOWN;
+#endif
+            reason = "certificate status unknown";
+            goto failed;
+        }
+
+        ngx_ssl_ocsp_done(ctx);
+    }
+
+    return NGX_OK;
+
+failed:
+
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "client SSL certificate OCSP verify error: %s, depth:%ui",
+                  reason, i);
+
+    X509_STORE_CTX_set_error_depth(x509_store, i);
+    X509_STORE_CTX_set_current_cert(x509_store, ctx->cert);
+    X509_STORE_CTX_set_error(x509_store, err);
+
+    ngx_ssl_ocsp_done(ctx);
+
+    return NGX_DECLINED;
+
+#endif
+}
+
+
+#if !(NGX_WIN32)
+
+static void
+ngx_ssl_ocsp_sync_handler(ngx_ssl_ocsp_ctx_t *ctx)
+{
+    /* ngx_ssl_ocsp_process_body() reached the end of the response */
+    ctx->data = ctx;
+}
+
+
+static ngx_int_t
+ngx_ssl_ocsp_sync_request(ngx_ssl_ocsp_ctx_t *ctx, ngx_msec_t timeout)
+{
+    ngx_url_t   u;
+    ngx_uint_t  i;
+
+    if (ngx_ssl_ocsp_create_request(ctx) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (ctx->naddrs == 0) {
+
+        /* responder from the certificate, not resolved yet: blocking */
+
+        ngx_memzero(&u, sizeof(ngx_url_t));
+
+        u.host = ctx->host;
+        u.port = ctx->port;
+
+        if (ngx_inet_resolve_host(ctx->pool, &u) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+                          "%V could not be resolved", &ctx->host);
+            return NGX_ERROR;
+        }
+
+        ctx->addrs = u.addrs;
+        ctx->naddrs = u.naddrs;
+    }
+
+    for (i = 0; i < ctx->naddrs; i++) {
+
+        ctx->request->pos = ctx->request->start;
+        ctx->data = NULL;
+
+        if (ngx_ssl_ocsp_sync_exchange(ctx, &ctx->addrs[i], timeout)
+            == NGX_OK)
+        {
+            return NGX_OK;
+        }
+    }
+
+    return NGX_ERROR;
+}
+
+
+static ngx_int_t
+ngx_ssl_ocsp_sync_exchange(ngx_ssl_ocsp_ctx_t *ctx, ngx_addr_t *addr,
+    ngx_msec_t timeout)
+{
+    int           err;
+    ssize_t       n;
+    socklen_t     len;
+    ngx_int_t     rc;
+    ngx_socket_t  s;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, ctx->log, 0,
+                   "ssl ocsp handshake connect to %V", &addr->name);
+
+    s = ngx_socket(addr->sockaddr->sa_family, SOCK_STREAM, 0);
+    if (s == (ngx_socket_t) -1) {
+        ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_socket_errno,
+                      ngx_socket_n " failed");
+        return NGX_ERROR;
+    }
+
+    if (ngx_nonblocking(s) == -1) {
+        ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_socket_errno,
+                      ngx_nonblocking_n " failed");
+        goto failed;
+    }
+
+    if (connect(s, addr->sockaddr, addr->socklen) == -1) {
+
+        err = ngx_socket_errno;
+
+        if (err != NGX_EINPROGRESS) {
+            ngx_log_error(NGX_LOG_ERR, ctx->log, err,
+                          "connect() to OCSP responder %V failed",
+                          &addr->name);
+            goto failed;
+        }
+
+        if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLOUT, timeout) != NGX_OK) {
+            goto failed;
+        }
+
+        err = 0;
+        len = sizeof(int);
+
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, (void *) &err, &len) == -1) {
+            err = ngx_socket_errno;
+        }
+
+        if (err) {
+            ngx_log_error(NGX_LOG_ERR, ctx->log, err,
+                          "connect() to OCSP responder %V failed",
+                          &addr->name);
+            goto failed;
+        }
+    }
+
+    while (ctx->request->pos < ctx->request->last) {
+
+        n = send(s, ctx->request->pos, ctx->request->last - ctx->request->pos,
+                 0);
+
+        if (n > 0) {
+            ctx->request->pos += n;
+            continue;
+        }
+
+        err = ngx_socket_errno;
+
+        if (n == -1 && err == NGX_EAGAIN) {
+            if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLOUT, timeout) != NGX_OK) {
+                goto failed;
+            }
+
+            continue;
+        }
+
+        ngx_log_error(NGX_LOG_ERR, ctx->log, err,
+                      "send() to OCSP responder %V failed", &addr->name);
+        goto failed;
+    }
+
+    if (ctx->response == NULL) {
+        ctx->response = ngx_create_temp_buf(ctx->pool, 16384);
+        if (ctx->response == NULL) {
+            goto failed;
+        }
+    }
+
+    ctx->response->pos = ctx->response->start;
+    ctx->response->last = ctx->response->start;
+
+    for ( ;; ) {
+
+        if (ctx->response->last == ctx->response->end) {
+            ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+                          "OCSP responder %V sent too large response",
+                          &addr->name);
+            goto failed;
+        }
+
+        n = recv(s, ctx->response->last,
+                 ctx->response->end - ctx->response->last, 0);
+
+        if (n > 0) {
+            ctx->response->last += n;
+            continue;
+        }
+
+        if (n == 0) {
+            break;
+        }
+
+        err = ngx_socket_errno;
+
+        if (err == NGX_EAGAIN) {
+            if (ngx_ssl_ocsp_sync_wait(ctx, s, POLLIN, timeout) != NGX_OK) {
+                goto failed;
+            }
+
+            continue;
+        }
+
+        ngx_log_error(NGX_LOG_ERR, ctx->log, err,
+                      "recv() from OCSP responder %V failed", &addr->name);
+        goto failed;
+    }
+
+    ngx_close_socket(s);
+
+    /* reuse the asynchronous parser on the complete response */
+
+    ctx->state = 0;
+    ctx->count = 0;
+    ctx->code = 0;
+    ctx->done = 1;
+    ctx->process = ngx_ssl_ocsp_process_status_line;
+
+    rc = ctx->process(ctx);
+
+    if (rc != NGX_DONE || ctx->data == NULL) {
+        ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+                      "OCSP responder %V sent invalid response",
+                      &addr->name);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+
+failed:
+
+    ngx_close_socket(s);
+
+    return NGX_ERROR;
+}
+
+
+static ngx_int_t
+ngx_ssl_ocsp_sync_wait(ngx_ssl_ocsp_ctx_t *ctx, ngx_socket_t s, short events,
+    ngx_msec_t timeout)
+{
+    int            n;
+    struct pollfd  pfd;
+
+    pfd.fd = s;
+    pfd.events = events;
+    pfd.revents = 0;
+
+    do {
+        n = poll(&pfd, 1, (int) timeout);
+    } while (n == -1 && ngx_socket_errno == NGX_EINTR);
+
+    if (n == 0) {
+        ngx_log_error(NGX_LOG_ERR, ctx->log, NGX_ETIMEDOUT,
+                      "OCSP responder timed out");
+        return NGX_ERROR;
+    }
+
+    if (n == -1) {
+        ngx_log_error(NGX_LOG_ERR, ctx->log, ngx_socket_errno,
+                      "poll() failed");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+#endif
 
 
 void
@@ -2809,6 +3226,21 @@ ngx_ssl_ocsp_validate(ngx_connection_t *c)
 
 ngx_int_t
 ngx_ssl_ocsp_get_status(ngx_connection_t *c, const char **s)
+{
+    return NGX_OK;
+}
+
+
+ngx_uint_t
+ngx_ssl_ocsp_rejected(ngx_connection_t *c)
+{
+    return 0;
+}
+
+
+ngx_int_t
+ngx_ssl_ocsp_verify_handshake(ngx_connection_t *c, X509_STORE_CTX *x509_store,
+    ngx_msec_t timeout)
 {
     return NGX_OK;
 }

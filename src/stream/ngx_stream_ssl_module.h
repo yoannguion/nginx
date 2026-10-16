@@ -28,6 +28,7 @@ typedef struct {
     ngx_uint_t        verify;
     ngx_uint_t        verify_depth;
     ngx_flag_t        verify_reject;
+    ngx_msec_t        ocsp_timeout;
 
     ssize_t           builtin_session_cache;
 

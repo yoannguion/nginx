@@ -1206,9 +1206,10 @@ ngx_ssl_cert_already_in_hash(void)
 static int
 ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
 {
-    int                reject;
-    ngx_connection_t  *c;
-    ngx_ssl_conn_t    *ssl_conn;
+    int                       reject;
+    ngx_connection_t         *c;
+    ngx_ssl_conn_t           *ssl_conn;
+    ngx_ssl_verify_reject_t  *vr;
 #if (NGX_DEBUG)
     char              *subject, *issuer;
     int                err, depth;
@@ -1224,9 +1225,29 @@ ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
 
     c = ngx_ssl_get_connection(ssl_conn);
 
-    reject = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn),
-                                 ngx_ssl_verify_reject_index)
-             != NULL;
+    vr = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn),
+                             ngx_ssl_verify_reject_index);
+    reject = (vr != NULL);
+
+    /*
+     * the chain is complete and valid when the callback is called
+     * for the leaf certificate: check its revocation status with OCSP
+     * before the handshake completes, using the OCSP cache if possible,
+     * a blocking request to the responder otherwise
+     */
+
+    if (reject && ok
+        && X509_STORE_CTX_get_error_depth(x509_store) == 0
+        && !c->ssl->ocsp_handshake)
+    {
+        c->ssl->ocsp_handshake = 1;
+
+        if (ngx_ssl_ocsp_verify_handshake(c, x509_store, vr->ocsp_timeout)
+            != NGX_OK)
+        {
+            ok = 0;
+        }
+    }
 
     if (!ok && reject) {
         ngx_log_error(NGX_LOG_INFO, c->log, 0,
@@ -1294,13 +1315,20 @@ ngx_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
 
 
 ngx_int_t
-ngx_ssl_verify_reject(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_uint_t required)
+ngx_ssl_verify_reject(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_uint_t required,
+    ngx_msec_t ocsp_timeout)
 {
-    int  mode;
+    int                       mode;
+    ngx_ssl_verify_reject_t  *vr;
 
-    if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_verify_reject_index,
-                            (void *) 1)
-        == 0)
+    vr = ngx_pcalloc(cf->pool, sizeof(ngx_ssl_verify_reject_t));
+    if (vr == NULL) {
+        return NGX_ERROR;
+    }
+
+    vr->ocsp_timeout = ocsp_timeout;
+
+    if (SSL_CTX_set_ex_data(ssl->ctx, ngx_ssl_verify_reject_index, vr) == 0)
     {
         ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
                       "SSL_CTX_set_ex_data() failed");
@@ -2327,6 +2355,10 @@ ngx_ssl_handshake(ngx_connection_t *c)
             return NGX_AGAIN;
         }
 
+        if (ngx_ssl_ocsp_rejected(c)) {
+            return NGX_ERROR;
+        }
+
         c->ssl->handshaked = 1;
 
         return NGX_OK;
@@ -2481,6 +2513,10 @@ ngx_ssl_try_early_data(ngx_connection_t *c)
             c->read->handler = ngx_ssl_handshake_handler;
             c->write->handler = ngx_ssl_handshake_handler;
             return NGX_AGAIN;
+        }
+
+        if (ngx_ssl_ocsp_rejected(c)) {
+            return NGX_ERROR;
         }
 
         c->ssl->handshaked = 1;

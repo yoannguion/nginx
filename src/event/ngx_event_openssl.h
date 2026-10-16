@@ -102,6 +102,11 @@
 typedef struct ngx_ssl_ocsp_s   ngx_ssl_ocsp_t;
 
 
+typedef struct {
+    ngx_msec_t                  ocsp_timeout;
+} ngx_ssl_verify_reject_t;
+
+
 struct ngx_ssl_s {
     SSL_CTX                    *ctx;
     ngx_log_t                  *log;
@@ -147,6 +152,7 @@ struct ngx_ssl_connection_s {
     unsigned                    try_early_data:1;
     unsigned                    in_early:1;
     unsigned                    in_ocsp:1;
+    unsigned                    ocsp_handshake:1;
     unsigned                    early_preread:1;
     unsigned                    write_blocked:1;
     unsigned                    sni_accepted:1;
@@ -250,7 +256,7 @@ ngx_int_t ngx_ssl_ciphers(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *ciphers,
 ngx_int_t ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl,
     ngx_str_t *cert, ngx_int_t depth);
 ngx_int_t ngx_ssl_verify_reject(ngx_conf_t *cf, ngx_ssl_t *ssl,
-    ngx_uint_t required);
+    ngx_uint_t required, ngx_msec_t ocsp_timeout);
 ngx_int_t ngx_ssl_trusted_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl,
     ngx_str_t *cert, ngx_int_t depth);
 ngx_int_t ngx_ssl_crl(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *crl);
@@ -265,6 +271,9 @@ ngx_int_t ngx_ssl_ocsp_resolver(ngx_conf_t *cf, ngx_ssl_t *ssl,
 
 ngx_int_t ngx_ssl_ocsp_validate(ngx_connection_t *c);
 ngx_int_t ngx_ssl_ocsp_get_status(ngx_connection_t *c, const char **s);
+ngx_int_t ngx_ssl_ocsp_verify_handshake(ngx_connection_t *c,
+    X509_STORE_CTX *x509_store, ngx_msec_t timeout);
+ngx_uint_t ngx_ssl_ocsp_rejected(ngx_connection_t *c);
 void ngx_ssl_ocsp_cleanup(ngx_connection_t *c);
 ngx_int_t ngx_ssl_ocsp_cache_init(ngx_shm_zone_t *shm_zone, void *data);
 
